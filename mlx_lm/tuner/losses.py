@@ -583,11 +583,7 @@ def _make_js_backward_kernel():
     constexpr int full_blocks = V / block;
     constexpr int extra = V - full_blocks * block;
 
-    threadgroup float shared[32 * 2];
-
     uint out_idx = threadgroup_position_in_grid.y;
-    uint simd_lane_id = thread_index_in_simdgroup;
-    uint simd_group_id = simdgroup_index_in_threadgroup;
 
     logits_q += out_idx * V;
     logits_p += out_idx * V;
