@@ -865,6 +865,7 @@ def _make_ce_backward_kernel():
         threadgroup_barrier(mem_flags::mem_threadgroup);
         max_v = shared[simd_lane_id];
         max_v = simd_max(max_v);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Reduce sum_exp across threadgroup
         sum_exp *= metal::fast::exp(prev_max - max_v);
@@ -879,7 +880,7 @@ def _make_ce_backward_kernel():
         lse = max_v + metal::fast::log(sum_exp);
     }
 
-    threadgroup_barrier(mem_flags::mem_none);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Write grad = c * (softmax(logits) - onehot(target))
     {
@@ -927,12 +928,14 @@ _ce_backward_kernel = _make_ce_backward_kernel()
 def _fused_cross_entropy(logits, targets):
     """Fused cross-entropy with class-index targets.
 
-    Forward uses mx.fast.cross_entropy (fused lse + gather).
+    Forward computes lse - logits[target] per row.
     Backward uses a custom Metal kernel that computes
     grad = cotan * (softmax(logits) - onehot(targets)) in one pass
     without materializing the full softmax as a separate array.
     """
-    return mx.fast.cross_entropy(logits, targets)
+    lse = mx.logsumexp(logits, axis=-1)
+    gathered = mx.take_along_axis(logits, targets[..., None], axis=-1).squeeze(-1)
+    return lse - gathered
 
 
 @_fused_cross_entropy.vjp
