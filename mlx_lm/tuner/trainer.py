@@ -17,6 +17,7 @@ from ..cli_ui import TrainUI, rprint
 from ..utils import maybe_set_recommended_wired_limit
 from .callbacks import TrainingCallback
 from .datasets import CacheDataset
+from .losses import fused_cross_entropy
 
 
 def _clear_cache(threshold: int):
@@ -94,7 +95,7 @@ def default_loss(model, batch, lengths):
     steps = mx.arange(1, targets.shape[1] + 1)
     mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
 
-    ce = nn.losses.cross_entropy(logits, targets) * mask
+    ce = fused_cross_entropy(logits, targets) * mask
     ntoks = mask.sum()
     ce = ce.astype(mx.float32).sum() / ntoks
 

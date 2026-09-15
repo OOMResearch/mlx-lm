@@ -794,3 +794,173 @@ def js_div_loss(logits_q, logits_p):
         kl_p = nn.losses.kl_div_loss(logprobs_m, logprobs_p, axis=-1, reduction="none")
         kl_q = nn.losses.kl_div_loss(logprobs_m, logprobs_q, axis=-1, reduction="none")
         return 0.5 * (kl_p + kl_q)
+
+
+def _make_ce_backward_kernel():
+    if not can_run_metal():
+        return
+    source = """
+    constexpr int M = 4;
+    constexpr int block = 1024 * M;
+    constexpr int full_blocks = V / block;
+    constexpr int extra = V - full_blocks * block;
+
+    threadgroup float shared[32];
+
+    uint row_idx = threadgroup_position_in_grid.y;
+    uint simd_lane_id = thread_index_in_simdgroup;
+    uint simd_group_id = simdgroup_index_in_threadgroup;
+
+    logits += row_idx * V;
+    targets += row_idx;
+    cotan += row_idx;
+    out += row_idx * V;
+
+    int target = (int)targets[0];
+    float c = cotan[0];
+
+    // Compute lse = logsumexp(logits[row])
+    float lse;
+    {
+        float max_v = -1e30;
+        float sum_exp = 0;
+
+        int offset = thread_index_in_threadgroup * M;
+        for (int i = 0; i < full_blocks; i++) {
+            float vals[M];
+            for (int j = 0; j < M; j++) {
+                vals[j] = logits[offset + j];
+            }
+            float prev_max = max_v;
+            for (int j = 0; j < M; j++) {
+                max_v = max(max_v, vals[j]);
+            }
+            sum_exp *= metal::fast::exp(prev_max - max_v);
+            for (int j = 0; j < M; j++) {
+                sum_exp += metal::fast::exp(vals[j] - max_v);
+            }
+            offset += block;
+        }
+        if (extra > 0) {
+            float vals[M];
+            for (int j = 0; j < M; j++) {
+                vals[j] = (offset + j < V) ? logits[offset + j] : -1e30;
+            }
+            float prev_max = max_v;
+            for (int j = 0; j < M; j++) {
+                max_v = max(max_v, vals[j]);
+            }
+            sum_exp *= metal::fast::exp(prev_max - max_v);
+            for (int j = 0; j < M; j++) {
+                sum_exp += metal::fast::exp(vals[j] - max_v);
+            }
+        }
+
+        // Reduce max across threadgroup
+        float prev_max = max_v;
+        max_v = simd_max(max_v);
+        if (simd_lane_id == 0) {
+            shared[simd_group_id] = max_v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        max_v = shared[simd_lane_id];
+        max_v = simd_max(max_v);
+
+        // Reduce sum_exp across threadgroup
+        sum_exp *= metal::fast::exp(prev_max - max_v);
+        sum_exp = simd_sum(sum_exp);
+        if (simd_lane_id == 0) {
+            shared[simd_group_id] = sum_exp;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sum_exp = shared[simd_lane_id];
+        sum_exp = simd_sum(sum_exp);
+
+        lse = max_v + metal::fast::log(sum_exp);
+    }
+
+    threadgroup_barrier(mem_flags::mem_none);
+
+    // Write grad = c * (softmax(logits) - onehot(target))
+    {
+        int offset = thread_index_in_threadgroup * M;
+        for (int i = 0; i < full_blocks; i++) {
+            float vals[M];
+            for (int j = 0; j < M; j++) {
+                vals[j] = logits[offset + j];
+            }
+            for (int j = 0; j < M; j++) {
+                int idx = offset + j;
+                float s = metal::fast::exp(vals[j] - lse);
+                if (idx == target) s -= 1.0f;
+                out[idx] = static_cast<T>(c * s);
+            }
+            offset += block;
+        }
+        if (extra > 0) {
+            for (int j = 0; j < M; j++) {
+                int idx = offset + j;
+                if (idx < V) {
+                    float v = logits[idx];
+                    float s = metal::fast::exp(v - lse);
+                    if (idx == target) s -= 1.0f;
+                    out[idx] = static_cast<T>(c * s);
+                }
+            }
+        }
+    }
+    """
+
+    return mx.fast.metal_kernel(
+        name="ce_backward",
+        input_names=["logits", "targets", "cotan"],
+        output_names=["out"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+_ce_backward_kernel = _make_ce_backward_kernel()
+
+
+@mx.custom_function
+def _fused_cross_entropy(logits, targets):
+    """Fused cross-entropy with class-index targets.
+
+    Forward uses mx.fast.cross_entropy (fused lse + gather).
+    Backward uses a custom Metal kernel that computes
+    grad = cotan * (softmax(logits) - onehot(targets)) in one pass
+    without materializing the full softmax as a separate array.
+    """
+    return mx.fast.cross_entropy(logits, targets)
+
+
+@_fused_cross_entropy.vjp
+def _fused_cross_entropy(primals, cotangent, output):
+    logits, targets = primals
+    dt = logits.dtype
+    n_rows = logits.size // logits.shape[-1]
+
+    grad = _ce_backward_kernel(
+        inputs=[logits, targets, cotangent],
+        output_shapes=[logits.shape],
+        output_dtypes=[dt],
+        template=[("T", dt), ("V", logits.shape[-1])],
+        grid=(1024, n_rows, 1),
+        threadgroup=(1024, 1, 1),
+    )[0]
+    return grad, mx.zeros_like(targets)
+
+
+def fused_cross_entropy(logits, targets):
+    """Cross-entropy loss with a fused backward pass.
+
+    Drop-in replacement for ``nn.losses.cross_entropy(logits, targets)``
+    when targets are class indices. On Metal the backward is a single
+    kernel pass that computes ``softmax - onehot`` directly, avoiding
+    the full ``[B, T, V]`` softmax allocation in autograd.
+    """
+    if can_run_metal():
+        return _fused_cross_entropy(logits, targets)
+    else:
+        return nn.losses.cross_entropy(logits, targets)
