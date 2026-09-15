@@ -6,7 +6,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from mlx_lm.tuner.trainer import iterate_batches
+from mlx.utils import tree_flatten
+
+from mlx_lm.tuner.trainer import grad_checkpoint, iterate_batches
 
 
 class MockDistributedGroup:
@@ -259,6 +261,46 @@ class TestTunerTrainer(unittest.TestCase):
             return model._get_per_layer_inputs(None, x).sum()
 
         mx.eval(mx.grad(loss_fn)(embeddings))
+
+    def test_grad_checkpoint_is_per_instance(self):
+        # A model that checkpoints its layers must not affect unrelated
+        # model instances of the same layer class, and must not stack
+        # wrappers if applied more than once.
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = mx.zeros((4, 4))
+
+            def __call__(self, x):
+                return x @ self.w
+
+        class ToyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = [Block() for _ in range(2)]
+
+            def __call__(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+
+        model_a = ToyModel()
+        before = sorted(dict(tree_flatten(model_a.trainable_parameters())).keys())
+        grad_checkpoint(model_a)
+        after = sorted(dict(tree_flatten(model_a.trainable_parameters())).keys())
+        self.assertEqual(before, after)
+
+        model_b = ToyModel()
+        self.assertIs(type(model_b.layers[0]), Block)
+
+        grad_checkpoint(model_a)
+        self.assertEqual(
+            type(model_a.layers[0]).__mro__[:2], (type(model_a.layers[0]), Block)
+        )
+
+        x = mx.zeros((1, 4))
+        mx.eval(model_a(x))
+        mx.eval(model_b(x))
 
 
 if __name__ == "__main__":

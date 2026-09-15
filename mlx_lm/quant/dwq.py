@@ -100,7 +100,7 @@ def dwq_quantize(
     print_trainable_parameters(model)
 
     if gradient_checkpoint:
-        grad_checkpoint(model.layers[0])
+        grad_checkpoint(model)
 
     scale = 1 / temperature
 

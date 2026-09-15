@@ -65,7 +65,7 @@ def estimate_sensitivities(
         return kl_div_loss(q_model(batch), targets).mean()
 
     if gradient_checkpoint:
-        grad_checkpoint(q_model.layers[0])
+        grad_checkpoint(q_model)
 
     grad_accum = tree_map(
         lambda x: mx.zeros(x.shape, dtype=gradient_accum_dtype),

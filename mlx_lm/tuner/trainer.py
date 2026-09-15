@@ -24,20 +24,37 @@ def _clear_cache(threshold: int):
         mx.clear_cache()
 
 
-def grad_checkpoint(layer):
+def grad_checkpoint(model):
     """
-    Update all instances of type(layer) to use gradient checkpointing.
+    Enable gradient checkpointing for each layer in model.layers.
+
+    Each layer instance gets its own dynamically-created subclass with a
+    checkpointed __call__, rather than patching type(layer).__call__ in
+    place. Patching the shared class would affect every instance of that
+    class for the life of the process, including unrelated models built
+    later, and would stack wrappers if called more than once.
     """
-    fn = type(layer).__call__
+    for layer in model.layers:
+        if getattr(layer, "_grad_checkpointed", False):
+            continue
 
-    def checkpointed_fn(model, *args, **kwargs):
-        def inner_fn(params, *args, **kwargs):
-            model.update(params)
-            return fn(model, *args, **kwargs)
+        base_cls = type(layer)
+        fn = base_cls.__call__
 
-        return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
+        def checkpointed_fn(self, *args, __fn=fn, **kwargs):
+            def inner_fn(params, *args, **kwargs):
+                self.update(params)
+                return __fn(self, *args, **kwargs)
 
-    type(layer).__call__ = checkpointed_fn
+            return mx.checkpoint(inner_fn)(self.trainable_parameters(), *args, **kwargs)
+
+        checkpointed_cls = type(
+            f"Checkpointed{base_cls.__name__}",
+            (base_cls,),
+            {"__call__": checkpointed_fn},
+        )
+        layer.__class__ = checkpointed_cls
+        layer._grad_checkpointed = True
 
 
 @dataclass
@@ -234,7 +251,7 @@ def train(
     rank = world.rank()
 
     if args.grad_checkpoint:
-        grad_checkpoint(model.layers[0])
+        grad_checkpoint(model)
 
     loss_value_and_grad = nn.value_and_grad(model, loss)
 
