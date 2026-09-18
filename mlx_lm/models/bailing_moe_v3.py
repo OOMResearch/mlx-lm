@@ -96,6 +96,7 @@ class BailingMLP(nn.Module):
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
+@mx.compile
 def _group_expert_select(
     logits: mx.array,
     expert_bias: mx.array,

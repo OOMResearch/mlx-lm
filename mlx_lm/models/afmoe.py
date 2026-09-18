@@ -164,6 +164,52 @@ class MoERouter(nn.Module):
         return self.gate(x)
 
 
+@mx.compile
+def group_expert_select(
+    gates,
+    expert_bias,
+    top_k,
+    n_group,
+    topk_group,
+    route_norm,
+    route_scale,
+    score_function,
+):
+
+    if score_function == "sigmoid":
+        scores = mx.sigmoid(gates.astype(mx.float32))
+    else:
+        scores = mx.softmax(gates.astype(mx.float32), axis=-1)
+
+    selection_scores = scores + expert_bias
+
+    if n_group > 1:
+        selection_scores = mx.unflatten(
+            selection_scores, axis=-1, shape=(n_group, -1)
+        )
+        group_scores = mx.topk(selection_scores, 2, axis=-1).sum(
+            axis=-1, keepdims=True
+        )
+        k = n_group - topk_group
+        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        selection_scores = mx.put_along_axis(
+            selection_scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+        )
+        selection_scores = mx.flatten(selection_scores, -2, -1)
+
+    k = top_k
+    inds = mx.argpartition(-selection_scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
+
+    selected_scores = mx.take_along_axis(scores, inds, axis=-1)
+
+    if route_norm and top_k > 1:
+        denominator = selected_scores.sum(axis=-1, keepdims=True)
+        selected_scores = selected_scores / denominator
+
+    return inds, selected_scores * route_scale
+
+
 class AfmoeMoE(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -194,42 +240,16 @@ class AfmoeMoE(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         gates = self.router(x)
-
-        if self.score_func == "sigmoid":
-            scores = mx.sigmoid(gates.astype(mx.float32))
-        else:
-            scores = mx.softmax(gates.astype(mx.float32), axis=-1)
-
-        # Add expert bias for selection
-        selection_scores = scores + self.expert_bias
-
-        # Group-based expert selection if n_group > 1
-        if self.n_group > 1:
-            selection_scores = mx.unflatten(
-                selection_scores, axis=-1, shape=(self.n_group, -1)
-            )
-            group_scores = mx.topk(selection_scores, 2, axis=-1).sum(
-                axis=-1, keepdims=True
-            )
-            k = self.n_group - self.topk_group
-            group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
-            selection_scores = mx.put_along_axis(
-                selection_scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
-            )
-            selection_scores = mx.flatten(selection_scores, -2, -1)
-
-        # Select top-k experts
-        k = self.num_experts_per_tok
-        inds = mx.argpartition(-selection_scores, kth=k - 1, axis=-1)[..., :k]
-        inds = mx.stop_gradient(inds)
-
-        selected_scores = mx.take_along_axis(scores, inds, axis=-1)
-
-        if self.route_norm and self.num_experts_per_tok > 1:
-            denominator = selected_scores.sum(axis=-1, keepdims=True)
-            selected_scores = selected_scores / denominator
-
-        selected_scores = selected_scores * self.route_scale
+        inds, selected_scores = group_expert_select(
+            gates,
+            self.expert_bias,
+            self.num_experts_per_tok,
+            self.n_group,
+            self.topk_group,
+            self.route_norm,
+            self.route_scale,
+            self.score_func,
+        )
 
         y = self.experts(x, inds)
         y = (y * selected_scores[..., None]).sum(axis=-2).astype(y.dtype)

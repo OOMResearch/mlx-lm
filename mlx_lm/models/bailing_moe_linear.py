@@ -323,6 +323,7 @@ class LinearAttention(nn.Module):
         return self.dense(output)
 
 
+@mx.compile
 def group_expert_select(
     gates: mx.array,
     e_score_correction_bias: mx.array,

@@ -118,6 +118,25 @@ class KlearMLP(nn.Module):
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
+@mx.compile
+def moe_gate_select(
+    gates,
+    expert_bias,
+    top_k,
+    norm_topk_prob,
+):
+
+    in_type = gates.dtype
+    routing_weights = mx.sigmoid(gates.astype(mx.float32))
+    biased_weights = routing_weights + expert_bias.reshape((1, 1, -1))
+    inds = mx.argpartition(-biased_weights, kth=top_k - 1, axis=-1)[..., :top_k]
+    inds = mx.stop_gradient(inds)
+    scores = mx.take_along_axis(routing_weights, inds, axis=-1)
+    if norm_topk_prob:
+        scores = scores / mx.sum(scores, axis=-1, keepdims=True)
+    return inds, scores.astype(in_type)
+
+
 class KlearSparseMoeBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -137,15 +156,12 @@ class KlearSparseMoeBlock(nn.Module):
         self.expert_bias = mx.zeros((self.num_experts,), dtype=mx.float32)
 
     def __call__(self, x: mx.array) -> mx.array:
-        routing_weights = mx.sigmoid(self.gate(x).astype(mx.float32))
-        biased_weights = routing_weights + self.expert_bias.reshape((1, 1, -1))
-        k = self.top_k
-        inds = mx.argpartition(-biased_weights, kth=k - 1, axis=-1)[..., :k]
-        inds = mx.stop_gradient(inds)
-        scores = mx.take_along_axis(routing_weights, inds, axis=-1)
-        if self.norm_topk_prob:
-            scores = scores / mx.sum(scores, axis=-1, keepdims=True)
-        scores = scores.astype(x.dtype)
+        inds, scores = moe_gate_select(
+            self.gate(x),
+            self.expert_bias,
+            self.top_k,
+            self.norm_topk_prob,
+        )
         expert_out = self.experts(x, inds)
         y_experts = (expert_out * scores[..., None]).sum(axis=-2)
         coef = mx.softmax(self.coefficient(x), axis=-1, precise=True)
