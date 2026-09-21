@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
-from .activations import swiglu
+from .activations import precise_swiglu, swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
@@ -18,7 +17,7 @@ from .base import (
     scaled_dot_product_attention,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import gated_delta_update
+from .gated_delta import gated_delta_update, normalize_qk
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -56,13 +55,6 @@ class ModelArgs(BaseModelArgs):
     full_attention_interval: int = 4
 
 
-@partial(mx.compile, shapeless=True)
-def _precise_swiglu(h, gate, x):
-    gate = nn.silu(gate.astype(mx.float32))
-    x = x.astype(mx.float32)
-    return (gate * x).astype(h.dtype)
-
-
 class Qwen3NextRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -74,7 +66,7 @@ class Qwen3NextRMSNormGated(nn.Module):
     ) -> mx.array:
         x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
         if gate is not None:
-            return _precise_swiglu(hidden_states, gate, x)
+            return precise_swiglu(hidden_states, gate, x)
         else:
             return x.astype(hidden_states.dtype)
 
@@ -281,9 +273,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         ]
 
         state = cache[1] if cache else None
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q, k = normalize_qk(q, k, inv_scale=self.head_k_dim**-0.5, eps=1e-6)
 
         out, state = gated_delta_update(
             q,
