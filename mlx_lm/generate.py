@@ -72,7 +72,15 @@ def setup_arg_parser():
     parser.add_argument(
         "--adapter-path",
         type=str,
-        help="Optional path for the trained adapter weights and config.",
+        nargs="+",
+        help="Optional path(s) for the trained adapter weights and config. "
+        "Several adapters require --fuse-adapters.",
+    )
+    parser.add_argument(
+        "--fuse-adapters",
+        action="store_true",
+        help="Fold the adapters into the base weights after loading, so "
+        "generation skips the extra low-rank matmuls.",
     )
     parser.add_argument(
         "--extra-eos-token",
@@ -2002,6 +2010,8 @@ def batch_generate(
 def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
+    if args.adapter_path and len(args.adapter_path) > 1 and not args.fuse_adapters:
+        parser.error("several --adapter-path values require --fuse-adapters")
 
     if args.seed is not None:
         mx.random.seed(args.seed)
@@ -2044,6 +2054,7 @@ def main():
     model, tokenizer = load(
         model_path,
         adapter_path=args.adapter_path,
+        fuse_adapters=args.fuse_adapters,
         tokenizer_config=tokenizer_config,
         model_config={"quantize_activations": args.quantize_activations},
         trust_remote_code=args.trust_remote_code,

@@ -43,6 +43,11 @@ class TestUtils(unittest.TestCase):
         p2 = model_lazy.layers[0].mlp.up_proj.weight
         self.assertTrue(mx.allclose(p1, p2))
 
+    def test_load_several_adapters_requires_fusion(self):
+        with self.assertRaises(ValueError) as cm:
+            utils.load(HF_MODEL_PATH, adapter_path=["a", "b"])
+        self.assertIn("fuse_adapters", str(cm.exception))
+
     def test_load_config_decodes_tagged_floats(self):
         # transformers tags non-finite floats so that config.json stays valid
         # JSON for every parser; the tag has to be undone on the way back in.

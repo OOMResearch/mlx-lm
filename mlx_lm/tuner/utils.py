@@ -173,6 +173,31 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
     return model
 
 
+def fuse_adapters(model: nn.Module, dequantize: bool = False) -> nn.Module:
+    """
+    Fold every adapter layer into its base weights in place.
+
+    A fused model runs plain (or quantized) linears at inference time instead
+    of paying for the extra low-rank matmuls on every token.
+
+    Args:
+        model (nn.Module): The model with adapter layers.
+        dequantize (bool): If ``True`` keep fused layers in full precision
+          instead of re-quantizing layers whose base was quantized.
+
+    Returns:
+        nn.Module: The model with adapters folded into the base weights.
+    """
+    fused_modules = [
+        (name, module.fuse(dequantize=dequantize))
+        for name, module in model.named_modules()
+        if hasattr(module, "fuse")
+    ]
+    if fused_modules:
+        model.update_modules(tree_unflatten(fused_modules))
+    return model
+
+
 def remove_lora_layers(model: nn.Module) -> nn.Module:
     """
     Remove the LoRA layers from the model.

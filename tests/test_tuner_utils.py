@@ -12,7 +12,11 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.tuner.lora import LoRALinear
-from mlx_lm.tuner.utils import load_adapters, print_trainable_parameters
+from mlx_lm.tuner.utils import (
+    fuse_adapters,
+    load_adapters,
+    print_trainable_parameters,
+)
 
 
 class TestTunerUtils(unittest.TestCase):
@@ -184,6 +188,74 @@ class TestLoadAdapters(unittest.TestCase):
         )
         model = load_adapters(TinyModel(), path)
         self.assertIsInstance(model, nn.Module)
+
+
+class TestFuseAdapters(unittest.TestCase):
+    # Metal float32 matmuls are not bit-exact against the unfused path; the
+    # CPU stream makes these equivalence checks exact rather than tolerant.
+    def setUp(self):
+        self._device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+
+    def tearDown(self):
+        mx.set_default_device(self._device)
+
+    def _adapter(self, seed):
+        mx.random.seed(seed)
+        return _make_adapter(
+            {
+                "layers.0.proj.lora_a": mx.random.normal((4, 2)),
+                "layers.0.proj.lora_b": mx.random.normal((2, 3)),
+            }
+        )
+
+    def test_fused_model_matches_unfused_output(self):
+        base = TinyModel()
+        x = mx.random.normal((2, 4))
+        path = self._adapter(0)
+
+        unfused = load_adapters(base, path)
+        expected = unfused.layers[0].proj(x)
+
+        fused = fuse_adapters(unfused)
+        self.assertIsInstance(fused.layers[0].proj, nn.Linear)
+        self.assertNotIsInstance(fused.layers[0].proj, LoRALinear)
+        self.assertTrue(mx.allclose(fused.layers[0].proj(x), expected, atol=1e-5))
+
+    def test_fusing_several_adapters_sums_their_deltas(self):
+        model = TinyModel()
+        weight = model.layers[0].proj.weight
+        paths = [self._adapter(1), self._adapter(2)]
+
+        expected = weight
+        for path in paths:
+            adapter = mx.load(str(path / "adapters.safetensors"))
+            a = adapter["layers.0.proj.lora_a"]
+            b = adapter["layers.0.proj.lora_b"]
+            expected = expected + (b.T @ a.T)
+
+        for path in paths:
+            model = fuse_adapters(load_adapters(model, path))
+        self.assertTrue(mx.allclose(model.layers[0].proj.weight, expected, atol=1e-5))
+
+    def test_fuse_keeps_quantized_base_quantized(self):
+        model = TinyModel()
+        model.layers[0].proj = nn.Linear(64, 32, bias=False)
+        nn.quantize(model, group_size=32, bits=4)
+        path = _make_adapter(
+            {
+                "layers.0.proj.lora_a": mx.zeros((64, 2)),
+                "layers.0.proj.lora_b": mx.zeros((2, 32)),
+            }
+        )
+        model = fuse_adapters(load_adapters(model, path))
+        self.assertIsInstance(model.layers[0].proj, nn.QuantizedLinear)
+
+        model = TinyModel()
+        model.layers[0].proj = nn.Linear(64, 32, bias=False)
+        nn.quantize(model, group_size=32, bits=4)
+        model = fuse_adapters(load_adapters(model, path), dequantize=True)
+        self.assertNotIsInstance(model.layers[0].proj, nn.QuantizedLinear)
 
 
 if __name__ == "__main__":

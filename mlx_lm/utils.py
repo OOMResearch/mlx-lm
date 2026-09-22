@@ -18,6 +18,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Sequence,
     Tuple,
     Type,
     Union,
@@ -566,6 +567,14 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
     return _load_adapters(model, adapter_path)
 
 
+def _adapter_paths(adapter_path) -> List[str]:
+    if adapter_path is None:
+        return []
+    if isinstance(adapter_path, (str, Path)):
+        return [adapter_path]
+    return list(adapter_path)
+
+
 def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
@@ -594,11 +603,12 @@ def load(
     path_or_hf_repo: str,
     tokenizer_config: Optional[Dict[str, Any]] = None,
     model_config: Optional[Dict[str, Any]] = None,
-    adapter_path: Optional[str] = None,
+    adapter_path: Optional[Union[str, Sequence[str]]] = None,
     lazy: bool = False,
     return_config: bool = False,
     revision: Optional[str] = None,
     trust_remote_code: bool = False,
+    fuse_adapters: bool = False,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
     Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
@@ -612,8 +622,9 @@ def load(
             Defaults to an empty dictionary.
         model_config(dict, optional): Configuration parameters specifically for the model.
             Defaults to an empty dictionary.
-        adapter_path (str, optional): Path to the LoRA adapters. If provided, applies LoRA layers
-            to the model. Default: ``None``.
+        adapter_path (str or list of str, optional): Path to the LoRA adapters. If provided,
+            applies LoRA layers to the model. Several paths are applied in order and
+            require ``fuse_adapters=True``. Default: ``None``.
         lazy (bool): If ``False`` eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
@@ -622,6 +633,9 @@ def load(
         trust_remote_code (bool): If ``True``, allow loading models that require
             executing a custom Python file specified in their config.
             Default: ``False``.
+        fuse_adapters (bool): If ``True`` fold the adapters into the base weights
+            after loading, so generation runs without the extra low-rank matmuls.
+            Quantized base layers are re-quantized after fusion. Default: ``False``.
     Returns:
         Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
             A tuple containing the loaded model, tokenizer and, if requested, the model config.
@@ -630,6 +644,10 @@ def load(
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
+    adapter_paths = _adapter_paths(adapter_path)
+    if len(adapter_paths) > 1 and not fuse_adapters:
+        raise ValueError("Loading several adapters requires fuse_adapters=True.")
+
     model_path = _download(path_or_hf_repo, revision=revision)
 
     model, config = load_model(
@@ -638,8 +656,13 @@ def load(
         model_config=model_config,
         trust_remote_code=trust_remote_code,
     )
-    if adapter_path is not None:
-        model = load_adapters(model, adapter_path)
+    if adapter_paths:
+        from .tuner.utils import fuse_adapters as _fuse_adapters
+
+        for path in adapter_paths:
+            model = load_adapters(model, path)
+            if fuse_adapters:
+                model = _fuse_adapters(model)
         model.eval()
     tokenizer = load_tokenizer(
         model_path, tokenizer_config, eos_token_ids=config.get("eos_token_id", None)
@@ -828,8 +851,7 @@ def upload_to_hub(path: str, upload_repo: str):
     else:
         provenance = ""
 
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         {provenance}
         ## Use with mlx
@@ -853,8 +875,7 @@ def upload_to_hub(path: str, upload_repo: str):
 
         response = generate(model, tokenizer, prompt=prompt, verbose=True)
         ```
-        """
-    )
+        """)
     card.save(card_path)
 
     api = HfApi()

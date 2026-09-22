@@ -3,9 +3,10 @@
 import argparse
 from pathlib import Path
 
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten
 
 from .gguf import convert_to_gguf
+from .tuner.utils import fuse_adapters, load_adapters
 from .utils import (
     dequantize_model,
     load,
@@ -31,8 +32,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--adapter-path",
         type=str,
-        default="adapters",
-        help="Path to the trained adapter weights and config.",
+        nargs="+",
+        default=["adapters"],
+        help="Path(s) to the trained adapter weights and config. Several "
+        "adapters are fused into the base model in the order given.",
     )
     parser.add_argument(
         "--upload-repo",
@@ -70,19 +73,12 @@ def main() -> None:
 
     model, tokenizer, config = load(
         args.model,
-        adapter_path=args.adapter_path,
         return_config=True,
         trust_remote_code=args.trust_remote_code,
     )
-
-    fused_linears = [
-        (n, m.fuse(dequantize=args.dequantize))
-        for n, m in model.named_modules()
-        if hasattr(m, "fuse")
-    ]
-
-    if fused_linears:
-        model.update_modules(tree_unflatten(fused_linears))
+    for adapter_path in args.adapter_path:
+        model = load_adapters(model, adapter_path)
+        model = fuse_adapters(model, dequantize=args.dequantize)
 
     if args.dequantize:
         print("Dequantizing model")
