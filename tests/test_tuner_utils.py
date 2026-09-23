@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+import warnings
 from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -248,8 +249,11 @@ class TestFuseAdapters(unittest.TestCase):
                 "layers.0.proj.lora_b": mx.zeros((2, 32)),
             }
         )
-        model = fuse_adapters(load_adapters(model, path))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            model = fuse_adapters(load_adapters(model, path))
         self.assertIsInstance(model.layers[0].proj, nn.QuantizedLinear)
+        self.assertTrue(any("re-quantizes" in str(w.message) for w in caught))
 
         model = TinyModel()
         model.layers[0].proj = nn.Linear(64, 32, bias=False)

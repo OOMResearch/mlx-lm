@@ -2,6 +2,7 @@
 
 import json
 import types
+import warnings
 from pathlib import Path
 from typing import Dict
 
@@ -184,10 +185,25 @@ def fuse_adapters(model: nn.Module, dequantize: bool = False) -> nn.Module:
         model (nn.Module): The model with adapter layers.
         dequantize (bool): If ``True`` keep fused layers in full precision
           instead of re-quantizing layers whose base was quantized.
+          Re-quantizing rounds away most of a low-rank update that is small
+          relative to the quantization step; for a quantized result, prefer
+          fusing into the full-precision base and quantizing afterwards.
 
     Returns:
         nn.Module: The model with adapters folded into the base weights.
     """
+    if not dequantize and any(
+        _has_quantized_base(module)
+        for _, module in model.named_modules()
+        if hasattr(module, "fuse")
+    ):
+        warnings.warn(
+            "Fusing adapters into a quantized base re-quantizes the fused "
+            "weights, which can discard much of the adapter's effect. Fuse "
+            "into the full-precision model and quantize afterwards, or pass "
+            "dequantize=True.",
+            stacklevel=2,
+        )
     fused_modules = [
         (name, module.fuse(dequantize=dequantize))
         for name, module in model.named_modules()
@@ -196,6 +212,13 @@ def fuse_adapters(model: nn.Module, dequantize: bool = False) -> nn.Module:
     if fused_modules:
         model.update_modules(tree_unflatten(fused_modules))
     return model
+
+
+def _has_quantized_base(module: nn.Module) -> bool:
+    base = getattr(module, "linear", None) or getattr(module, "embedding", None)
+    return isinstance(
+        base, (nn.QuantizedLinear, QuantizedSwitchLinear, nn.QuantizedEmbedding)
+    )
 
 
 def remove_lora_layers(model: nn.Module) -> nn.Module:
