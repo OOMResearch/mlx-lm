@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import math
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -71,21 +72,25 @@ def estimate_sensitivities(
         lambda x: mx.zeros(x.shape, dtype=gradient_accum_dtype),
         q_model.trainable_parameters(),
     )
+    loss_and_grad = nn.value_and_grad(q_model, loss_fn)
+    state = [model.state, q_model.state]
+
+    @partial(mx.compile, inputs=state, outputs=state)
+    def step(batch, grad_accum):
+        targets = mx.stop_gradient(model(batch))
+        _, grads = loss_and_grad(batch, targets)
+        return tree_map(lambda x, y: x + y, grad_accum, grads)
+
+    n_batches = (len(data) + batch_size - 1) // batch_size
     for s in tqdm(
         range(0, len(data), batch_size),
-        total=len(data) // batch_size,
+        total=n_batches,
         desc="Estimating sensitivities",
     ):
-        batch = data[s : s + batch_size]
-        targets = model(batch)
-        mx.eval(targets)
-        _, grads = nn.value_and_grad(q_model, loss_fn)(batch, targets)
-        grad_accum = tree_map(lambda x, y: x + y, grad_accum, grads)
-        del grads
+        grad_accum = step(data[s : s + batch_size], grad_accum)
         mx.eval(grad_accum)
 
     def compute_sensitivity(gradient, low_q_weight, original_weight):
-        n_batches = (len(data) + batch_size - 1) // batch_size
         gradient = gradient / n_batches
         high_q_weight = qdq(original_weight, high_bits, high_group_size)
         param_size = original_weight.size / 1e6
