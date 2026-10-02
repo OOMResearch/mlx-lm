@@ -4,6 +4,7 @@ import argparse
 import copy
 import time
 import types
+from functools import partial
 from pathlib import Path
 
 import mlx.core as mx
@@ -116,6 +117,9 @@ def dwq_quantize(
         loss = (mask * losses).sum() / ntoks
         return loss, ntoks
 
+    state = [model.state, opt.state]
+
+    @partial(mx.compile, inputs=state, outputs=state)
     def step(inputs, targets, lengths, params):
         (loss, ntoks), grads = mx.value_and_grad(loss_fn)(
             params, inputs, targets, lengths
