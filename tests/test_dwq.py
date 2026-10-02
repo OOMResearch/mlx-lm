@@ -1,7 +1,9 @@
 # Copyright © 2025 Apple Inc.
 
 import copy
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import mlx.core as mx
@@ -11,7 +13,8 @@ import numpy as np
 from mlx.utils import tree_flatten
 
 from mlx_lm.models import llama
-from mlx_lm.quant.dwq import dwq_quantize
+from mlx_lm.quant.dwq import _topk_indices, compute_dwq_targets, dwq_quantize
+from mlx_lm.tuner.trainer import iterate_batches
 
 
 class TestDWQ(unittest.TestCase):
@@ -85,6 +88,68 @@ class TestDWQ(unittest.TestCase):
         for k, v in tree_flatten(student.trainable_parameters()):
             self.assertTrue(mx.isfinite(v).all().item())
             self.assertFalse(mx.array_equal(v, before[k]).item())
+
+
+class TestDWQTargets(unittest.TestCase):
+    def assert_topk(self, x, idx, k):
+        self.assertEqual(idx.shape, (*x.shape[:-1], k))
+        self.assertLess(idx.max().item(), x.shape[-1])
+        ordered = mx.sort(idx.astype(mx.int64), axis=-1)
+        self.assertTrue((ordered[..., 1:] != ordered[..., :-1]).all().item())
+        expected = mx.sort(x, axis=-1)[..., -k:]
+        actual = mx.sort(mx.take_along_axis(x, idx, axis=-1), axis=-1)
+        self.assertTrue(mx.array_equal(actual, expected).item())
+
+    def test_topk_indices(self):
+        mx.random.seed(0)
+        cases = [
+            ((2, 3, 4096), 64),  # blocked, no padding
+            ((2, 3, 4099), 64),  # blocked, padded
+            ((3, 1000), 8),
+            ((2, 2, 200), 64),  # too small to block
+            ((1, 2, 64), 64),  # k equal to the axis size
+        ]
+        for shape, k in cases:
+            for dtype in [mx.float32, mx.bfloat16]:
+                x = mx.random.normal(shape).astype(dtype)
+                self.assert_topk(x, _topk_indices(x, k), k)
+                # Rounded values tie heavily, including across the k-th value.
+                x = mx.round(mx.random.normal(shape) * 2).astype(dtype)
+                self.assert_topk(x, _topk_indices(x, k), k)
+
+    def test_compute_dwq_targets(self):
+        mx.random.seed(0)
+        args = llama.ModelArgs(
+            model_type="llama",
+            hidden_size=64,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            num_attention_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=20_000,
+            tie_word_embeddings=False,
+        )
+        model = llama.Model(args)
+        mx.eval(model.parameters())
+        rng = np.random.default_rng(0)
+        data = [(rng.integers(0, 20_000, size=n).tolist(), 0) for n in [12, 16, 20, 24]]
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            compute_dwq_targets(model, Path(save_dir), data, data, 2, 64, seed=0)
+            for split in ["train", "valid"]:
+                files = sorted((Path(save_dir) / split).glob("*.safetensors"))
+                self.assertEqual(len(files), 2)
+                batches = iterate_batches(data, 2, 64, seed=0)
+                for file, (batch, _) in zip(files, batches):
+                    targets = mx.load(str(file))
+                    logits = model(batch[:, :-1])
+                    self.assert_topk(logits, targets["indices"], 1024)
+                    self.assertTrue(
+                        mx.array_equal(
+                            targets["logits"],
+                            mx.take_along_axis(logits, targets["indices"], axis=-1),
+                        ).item()
+                    )
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import math
 import time
 import types
 from functools import partial
@@ -26,6 +27,38 @@ from mlx_lm.utils import (
     save,
     sharded_load,
 )
+
+
+def _topk_indices(x: mx.array, k: int) -> mx.array:
+    """
+    Indices of the ``k`` largest entries of ``x`` along the last axis, in no
+    particular order.
+
+    Partitioning a full vocabulary-sized axis is expensive. Split the axis
+    into blocks instead: every one of the ``k`` largest entries lives in one
+    of the ``k`` blocks with the largest maximum, so only those blocks need to
+    be partitioned.
+    """
+    size = x.shape[-1]
+    block_size = 2 ** round(math.log2(math.sqrt(size / k)))
+    n_blocks = -(-size // block_size)
+    if block_size == 1 or n_blocks <= k:
+        return mx.argpartition(x, kth=-k, axis=-1)[..., -k:]
+
+    lead = x.shape[:-1]
+    pad = n_blocks * block_size - size
+    if pad > 0:
+        fill = mx.full((*lead, pad), -float("inf"), dtype=x.dtype)
+        x = mx.concatenate([x, fill], axis=-1)
+    blocks = x.reshape(*lead, n_blocks, block_size)
+
+    top_blocks = mx.argpartition(blocks.max(axis=-1), kth=-k, axis=-1)[..., -k:]
+    candidates = mx.take_along_axis(blocks, top_blocks[..., None], axis=-2)
+    candidates = candidates.reshape(*lead, k * block_size)
+    pos = mx.argpartition(candidates, kth=-k, axis=-1)[..., -k:]
+
+    block = mx.take_along_axis(top_blocks, pos // block_size, axis=-1)
+    return block * block_size + pos % block_size
 
 
 def compute_dwq_targets(
@@ -56,7 +89,7 @@ def compute_dwq_targets(
             logits = mx.stop_gradient(logits, stream=mx.cpu)
             mx.eval(logits)
             if rank == 0:
-                idx = mx.argpartition(logits, kth=-1024, axis=-1)[..., -1024:]
+                idx = _topk_indices(logits, 1024)
                 logits = mx.take_along_axis(logits, idx, axis=-1)
 
                 file = path / f"{i:010d}.safetensors"
