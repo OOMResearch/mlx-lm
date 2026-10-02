@@ -17,6 +17,7 @@ from ..cli_ui import TrainUI, rprint
 from ..utils import maybe_set_recommended_wired_limit
 from .callbacks import TrainingCallback
 from .datasets import CacheDataset
+from .quantized import dense_quantized_backward
 
 
 def _clear_cache(threshold: int):
@@ -260,6 +261,7 @@ def train(
 
         return lvalue, toks, grad
 
+    dense_quantized_backward(model)
     model.train()
     losses = 0
     n_tokens = 0
