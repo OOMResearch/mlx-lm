@@ -2,6 +2,7 @@
 
 
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -18,10 +19,26 @@ from ..utils import maybe_set_recommended_wired_limit
 from .callbacks import TrainingCallback
 from .datasets import CacheDataset
 
+# Default bound on the allocator's buffer cache while training.
+DEFAULT_CLEAR_CACHE_THRESHOLD = 1 << 30
 
-def _clear_cache(threshold: int):
-    if mx.get_cache_memory() > threshold:
-        mx.clear_cache()
+
+@contextmanager
+def _cache_limit(limit: int):
+    """
+    Bound the allocator's buffer cache to ``limit`` bytes inside the block.
+
+    Batches are padded to varying lengths, so buffers freed by one step are
+    often the wrong size for the next and an unbounded cache grows by
+    gigabytes per step. Letting the allocator evict as it goes keeps the cache
+    bounded without the synchronous ``mx.clear_cache()`` stall after every
+    step.
+    """
+    previous = mx.set_cache_limit(limit)
+    try:
+        yield
+    finally:
+        mx.set_cache_limit(previous)
 
 
 def grad_checkpoint(layer):
@@ -78,9 +95,9 @@ class TrainingArgs:
         },
     )
     clear_cache_threshold: int = field(
-        default=0,
+        default=DEFAULT_CLEAR_CACHE_THRESHOLD,
         metadata={
-            "help": "Clear the allocator cache between steps if it grows too large."
+            "help": "Maximum size in bytes of the allocator cache while training."
         },
     )
 
@@ -183,7 +200,7 @@ def evaluate(
     max_seq_length=2048,
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
-    clear_cache_threshold: int = 0,
+    clear_cache_threshold: int = DEFAULT_CLEAR_CACHE_THRESHOLD,
     progress_callback: Optional[callable] = None,
 ):
     model.eval()
@@ -202,14 +219,14 @@ def evaluate(
         ),
     )
 
-    for _, batch in batch_iter:
-        losses, toks = loss(model, *batch)
-        all_losses += losses * toks
-        ntokens += toks
-        mx.eval(all_losses, ntokens)
-        _clear_cache(clear_cache_threshold)
-        if progress_callback is not None:
-            progress_callback()
+    with _cache_limit(clear_cache_threshold):
+        for _, batch in batch_iter:
+            losses, toks = loss(model, *batch)
+            all_losses += losses * toks
+            ntokens += toks
+            mx.eval(all_losses, ntokens)
+            if progress_callback is not None:
+                progress_callback()
 
     all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
@@ -269,7 +286,7 @@ def train(
     grad_accum = None
 
     ui = TrainUI(args.iters, rank=rank)
-    with ui:
+    with ui, _cache_limit(args.clear_cache_threshold):
         # Main training loop
         for it, batch in zip(
             range(1, args.iters + 1),
@@ -302,6 +319,7 @@ def train(
                         num_batches=args.val_batches,
                         max_seq_length=args.max_seq_length,
                         iterate_batches=iterate_batches,
+                        clear_cache_threshold=args.clear_cache_threshold,
                         progress_callback=advance_val,
                     )
                 model.train()
@@ -329,7 +347,6 @@ def train(
             n_tokens += toks
             steps += 1
             mx.eval(state, losses, n_tokens, grad_accum)
-            _clear_cache(args.clear_cache_threshold)
             train_time += time.perf_counter() - tic
 
             ui.advance()
