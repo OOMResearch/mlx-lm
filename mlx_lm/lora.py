@@ -17,7 +17,13 @@ from tqdm import tqdm
 from .cli_ui import make_console, print_lora_run_header, rprint
 from .tuner.callbacks import get_reporting_callbacks
 from .tuner.datasets import CacheDataset, load_dataset
-from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
+from .tuner.trainer import (
+    DEFAULT_CLEAR_CACHE_THRESHOLD,
+    TrainingArgs,
+    TrainingCallback,
+    evaluate,
+    train,
+)
 from .tuner.utils import (
     build_schedule,
     linear_to_lora_layers,
@@ -72,7 +78,7 @@ CONFIG_DEFAULTS = {
     "config": None,
     "grad_checkpoint": False,
     "grad_accumulation_steps": 1,
-    "clear_cache_threshold": 0,
+    "clear_cache_threshold": DEFAULT_CLEAR_CACHE_THRESHOLD,
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
@@ -198,8 +204,8 @@ def build_parser():
     parser.add_argument(
         "--clear-cache-threshold",
         type=_parse_size,
-        default=0,
-        help="Clear the allocator cache between steps if it grows too large.",
+        default=None,
+        help="Maximum size of the allocator cache while training (default 1GB).",
     )
     parser.add_argument(
         "--report-to",
@@ -280,6 +286,7 @@ def train_model(
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
         grad_accumulation_steps=args.grad_accumulation_steps,
+        clear_cache_threshold=args.clear_cache_threshold,
     )
 
     # Initialize the selected optimizer
@@ -325,6 +332,7 @@ def evaluate_model(args, model: nn.Module, test_set):
         batch_size=args.batch_size,
         num_batches=args.test_batches,
         max_seq_length=args.max_seq_length,
+        clear_cache_threshold=args.clear_cache_threshold,
         progress_callback=pbar.update if pbar else None,
     )
     if pbar is not None:
