@@ -113,8 +113,15 @@ class DoRALinear(nn.Module):
         w = self._dequantized_weight()
         y = x @ w.T
 
-        z = (self.dropout(x) @ self.lora_a) @ self.lora_b
-        out = y + (self.scale * z).astype(x.dtype)
+        if x.dtype == mx.bfloat16:
+            # Stay in bfloat16 for the low-rank product instead of promoting
+            # the input to float32; see LoRALinear.__call__.
+            lora_a = self.lora_a.astype(x.dtype)
+            lora_b = (self.scale * self.lora_b).astype(x.dtype)
+            out = y + (self.dropout(x) @ lora_a) @ lora_b
+        else:
+            z = (self.dropout(x) @ self.lora_a) @ self.lora_b
+            out = y + (self.scale * z).astype(x.dtype)
 
         # Compute the norm of the adapted weights
         adapted = w + (self.scale * self.lora_b.T) @ self.lora_a.T

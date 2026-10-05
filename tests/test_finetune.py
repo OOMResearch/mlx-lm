@@ -430,6 +430,45 @@ class TestDora(unittest.TestCase):
             )
         )
 
+    def test_dora_bfloat16_matches_float32_path(self):
+        mx.random.seed(0)
+        linear = nn.Linear(64, 96, bias=False)
+        linear.set_dtype(mx.bfloat16)
+        dora = DoRALinear.from_base(linear, r=8, scale=10.0)
+        dora.lora_b = mx.random.normal(dora.lora_b.shape) * 0.1
+        x = mx.random.normal((4, 16, 64)).astype(mx.bfloat16)
+        keys = ["lora_a", "lora_b", "m"]
+
+        def reference(params, x):
+            # The adapter product computed in float32, as for other dtypes.
+            w = dora.linear.weight
+            z = (x @ params["lora_a"]) @ params["lora_b"]
+            out = x @ w.T + (dora.scale * z).astype(x.dtype)
+            adapted = w + (dora.scale * params["lora_b"].T) @ params["lora_a"].T
+            denom = mx.stop_gradient(mx.linalg.norm(adapted, axis=1))
+            return (params["m"] / denom).astype(x.dtype) * out
+
+        def actual(params, x):
+            dora.update(params)
+            return dora(x)
+
+        params = {k: dora[k] for k in keys}
+        out = actual(params, x)
+        self.assertEqual(out.dtype, mx.bfloat16)
+        expected = reference(params, x)
+        scale = mx.abs(expected).max().item()
+        self.assertLess(mx.abs(out - expected).max().item(), 2e-2 * scale)
+
+        weights = mx.random.normal(out.shape)
+        loss = lambda fn: lambda params: (fn(params, x) * weights).sum()
+        expected_grads = mx.grad(loss(reference))(params)
+        grads = mx.grad(loss(actual))(params)
+        for k in keys:
+            scale = mx.abs(expected_grads[k]).max().item()
+            self.assertGreater(scale, 0)
+            diff = mx.abs(grads[k] - expected_grads[k]).max().item()
+            self.assertLess(diff, 3e-2 * scale, k)
+
     def test_dora_dtype(self):
         in_dims = 256
         out_dims = 256
