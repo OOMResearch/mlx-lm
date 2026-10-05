@@ -94,6 +94,17 @@ class LoRALinear(nn.Module):
 
     def __call__(self, x):
         y = self.linear(x)
+        if x.dtype == mx.bfloat16:
+            # Stay in bfloat16 instead of promoting the input to the adapter's
+            # float32: the promotion makes every adapter create several
+            # full-size float32 temporaries, which costs more than the
+            # low-rank product itself. bfloat16 has float32's exponent range,
+            # so small gradients survive. float16 does not, and some adapter
+            # gradients already underflow to zero in it, so float16 inputs
+            # keep the float32 path below.
+            lora_a = self.lora_a.astype(x.dtype)
+            lora_b = (self.scale * self.lora_b).astype(x.dtype)
+            return y + (self.dropout(x) @ lora_a) @ lora_b
         z = (self.dropout(x) @ self.lora_a) @ self.lora_b
         return y + (self.scale * z).astype(x.dtype)
 
