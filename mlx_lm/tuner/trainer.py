@@ -18,6 +18,7 @@ from ..cli_ui import TrainUI, rprint
 from ..utils import maybe_set_recommended_wired_limit
 from .callbacks import TrainingCallback
 from .datasets import CacheDataset
+from .quantized import dense_quantized_backward
 
 # Default bound on the allocator's buffer cache while training.
 DEFAULT_CLEAR_CACHE_THRESHOLD = 1 << 30
@@ -277,6 +278,7 @@ def train(
 
         return lvalue, toks, grad
 
+    dense_quantized_backward(model)
     model.train()
     losses = 0
     n_tokens = 0
