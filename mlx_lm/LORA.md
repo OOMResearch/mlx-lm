@@ -393,6 +393,11 @@ of memory. Here are some tips to reduce memory use should you need to do so:
    `--grad-checkpoint` flag. Gradient checkpointing will be more helpful for
    larger batch sizes or sequence lengths with smaller or quantized models.
 
+6. Training keeps up to 1 GB of freed buffers cached for reuse. Lower this
+   with `--clear-cache-threshold` (for example `--clear-cache-threshold 0` or
+   `--clear-cache-threshold 256MB`) to trade a little speed for a smaller
+   memory footprint.
+
 For example, for a machine with 32 GB the following should run reasonably fast:
 
 ```

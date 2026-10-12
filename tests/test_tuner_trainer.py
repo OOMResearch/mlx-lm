@@ -6,7 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from mlx_lm.tuner.trainer import iterate_batches
+from mlx_lm.tuner.trainer import _cache_limit, evaluate, iterate_batches
 
 
 class MockDistributedGroup:
@@ -298,6 +298,50 @@ class TestTunerTrainer(unittest.TestCase):
             return model._get_per_layer_inputs(None, x).sum()
 
         mx.eval(mx.grad(loss_fn)(embeddings))
+
+    def test_cache_limit_is_scoped(self):
+        outer = 123 * 1024 * 1024
+        original = mx.set_cache_limit(outer)
+        try:
+            with _cache_limit(4096):
+                # set_cache_limit returns the limit it replaces.
+                self.assertEqual(mx.set_cache_limit(4096), 4096)
+            self.assertEqual(mx.set_cache_limit(outer), outer)
+
+            with self.assertRaises(RuntimeError):
+                with _cache_limit(4096):
+                    raise RuntimeError
+            self.assertEqual(mx.set_cache_limit(outer), outer)
+        finally:
+            mx.set_cache_limit(original)
+
+    def test_evaluate_bounds_cache(self):
+        outer = 123 * 1024 * 1024
+        limit = 4096
+        original = mx.set_cache_limit(outer)
+        seen = []
+
+        def loss(model, batch, lengths):
+            seen.append(mx.set_cache_limit(limit))
+            return mx.array(1.0), mx.array(1)
+
+        def batches(**kwargs):
+            yield from [(mx.zeros((1, 4)), mx.zeros((1, 2)))] * 3
+
+        try:
+            evaluate(
+                model=nn.Module(),
+                dataset=None,
+                batch_size=1,
+                num_batches=-1,
+                loss=loss,
+                iterate_batches=batches,
+                clear_cache_threshold=limit,
+            )
+            self.assertEqual(seen, [limit] * 3)
+            self.assertEqual(mx.set_cache_limit(outer), outer)
+        finally:
+            mx.set_cache_limit(original)
 
 
 if __name__ == "__main__":
