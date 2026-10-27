@@ -2,13 +2,27 @@
 
 import unittest
 
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import PreTrainedTokenizerFast
+
 from mlx_lm.tokenizer_utils import (
     BPEStreamingDetokenizer,
     NaiveStreamingDetokenizer,
     SPMStreamingDetokenizer,
     TokenizerWrapper,
 )
+from mlx_lm.tool_parsers import pythonic
 from mlx_lm.utils import load_tokenizer
+
+
+def make_tokenizer(tokens, chat_template=None):
+    """A word-level tokenizer with the given vocab and chat template."""
+    vocab = {t: i for i, t in enumerate(["<unk>", *tokens])}
+    backend = Tokenizer(WordLevel(vocab, unk_token="<unk>"))
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>")
+    tokenizer.chat_template = chat_template
+    return TokenizerWrapper(tokenizer)
 
 
 class TestTokenizers(unittest.TestCase):
@@ -133,6 +147,13 @@ class TestTokenizers(unittest.TestCase):
         tokenizer = load_tokenizer(tokenizer_repo)
         self.assertFalse(tokenizer.has_tool_calling)
 
+        tokenizer_repo = "LiquidAI/LFM2.5-1.2B-Instruct-MLX-8bit"
+        tokenizer = load_tokenizer(tokenizer_repo)
+        self.assertTrue(tokenizer.has_tool_calling)
+        self.assertEqual(tokenizer.tool_call_start, "<|tool_call_start|>")
+        self.assertEqual(tokenizer.tool_call_end, "<|tool_call_end|>")
+        self.assertEqual(tokenizer.tool_parser, pythonic.parse_tool_call)
+
     def test_thinking(self):
         tokenizer_repo = "mlx-community/Qwen3-4B-4bit"
         tokenizer = load_tokenizer(tokenizer_repo)
@@ -147,6 +168,32 @@ class TestTokenizers(unittest.TestCase):
         self.assertIsNone(tokenizer.think_end)
         self.assertIsNone(tokenizer.think_start_id)
         self.assertIsNone(tokenizer.think_end_id)
+
+    def test_thinking_from_vocab_or_template(self):
+        tokenizer = make_tokenizer(["[THINK]", "[/THINK]"])
+        self.assertEqual(tokenizer.think_start, "[THINK]")
+        self.assertEqual(tokenizer.think_end, "[/THINK]")
+
+        # The chat template writes the markers as text.
+        tokenizer = make_tokenizer([], chat_template="{{ '<think>' }}")
+        self.assertEqual(tokenizer.think_start, "<think>")
+        self.assertEqual(tokenizer.think_end, "</think>")
+
+    def test_thinking_kwarg_from_template(self):
+        messages = [{"role": "user", "content": "hi"}]
+        tokenizer = make_tokenizer(
+            ["<think>", "</think>"],
+            chat_template="{% if thinking is defined and thinking %}<think>{% endif %}",
+        )
+        self.assertEqual(
+            tokenizer.apply_chat_template(messages, tokenize=False), "<think>"
+        )
+        self.assertEqual(
+            tokenizer.apply_chat_template(
+                messages, tokenize=False, enable_thinking=False
+            ),
+            "",
+        )
 
     def test_find_token(self):
         # Check that _find returns a valid index when
