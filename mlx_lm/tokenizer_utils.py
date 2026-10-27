@@ -8,7 +8,7 @@ import inspect
 import json
 from functools import partial
 from json import JSONDecodeError
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -268,6 +268,7 @@ def _infer_thinking(tokenizer):
         ("<think>", "</think>"),
         ("<longcat_think>", "</longcat_think>"),
         ("<|think:start|>", "<|think:end|>"),
+        ("[THINK]", "[/THINK]"),
     ]
 
     # Single token thinking modes
@@ -301,6 +302,17 @@ def _infer_thinking(tokenizer):
             tuple(tokenizer.encode(think_end, add_special_tokens=False)),
         )
 
+    # Text markers, for chat templates that write them without a vocab token.
+    if "<think>" in _chat_template_text(tokenizer):
+        think_start = "<think>"
+        think_end = "</think>"
+        return (
+            think_start,
+            think_end,
+            tuple(tokenizer.encode(think_start, add_special_tokens=False)),
+            tuple(tokenizer.encode(think_end, add_special_tokens=False)),
+        )
+
     return (None, None, None, None)
 
 
@@ -308,6 +320,14 @@ def _is_xtml_vocab(vocab):
     return all(
         t in vocab for t in ("<|open|>", "<|close|>", "<|sep|>", "<|end_of_msg|>")
     )
+
+
+def _chat_template_text(tokenizer) -> str:
+    """The Jinja chat template, or an empty string."""
+    template = getattr(tokenizer, "chat_template", None)
+    if isinstance(template, dict):
+        template = template.get("default")
+    return template if isinstance(template, str) else ""
 
 
 def _infer_structural_markers(tokenizer):
@@ -332,6 +352,9 @@ def _infer_thinking_kwarg(tokenizer):
                 return "thinking", custom_renderer
         except (ValueError, TypeError):
             pass
+    template = _chat_template_text(tokenizer)
+    if " thinking is defined" in template and "enable_thinking" not in template:
+        return "thinking", custom_renderer
     return "enable_thinking", custom_renderer
 
 
@@ -351,6 +374,7 @@ class TokenizerWrapper:
         tool_call_start=None,
         tool_call_end=None,
         tool_parser=None,
+        response_format: Optional[Dict[str, Any]] = None,
     ):
         self._tokenizer = tokenizer
         # Built once, since building the token map is expensive.
@@ -365,6 +389,7 @@ class TokenizerWrapper:
             self._think_end_tokens,
         ) = _infer_thinking(tokenizer)
         self._structural_markers = _infer_structural_markers(tokenizer)
+        self._response_format = response_format or {}
 
         self._chat_template = chat_template
         self._thinking_kwarg, has_custom_renderer = _infer_thinking_kwarg(tokenizer)
@@ -505,6 +530,14 @@ class TokenizerWrapper:
         return self._structural_markers
 
     @property
+    def response_transitions(self) -> Dict[str, List[Tuple[str, str]]]:
+        return self._response_format.get("transitions", {})
+
+    @property
+    def response_initial_state(self) -> Optional[str]:
+        return self._response_format.get("initial_state")
+
+    @property
     def tool_parser(self):
         return self._tool_parser
 
@@ -619,33 +652,46 @@ def _is_bpe_decoder(decoder):
 def _infer_tool_parser(tokenizer):
     """Attempt to auto-infer a tool parser from the chat template or vocab."""
     chat_template = tokenizer.chat_template
-    if not isinstance(chat_template, str):
-        if _is_xtml_vocab(tokenizer.get_vocab()):
-            return "kimi_k3"
-        return None
-    elif "<minimax:tool_call>" in chat_template:
-        return "minimax_m2"
-    elif "<|tool_call>" in chat_template and "<tool_call|>" in chat_template:
-        return "gemma4"
-    elif "<start_function_call>" in chat_template:
-        return "function_gemma"
-    elif "<longcat_tool_call>" in chat_template:
-        return "longcat"
-    elif "<arg_key>" in chat_template:
-        return "glm47"
-    elif "<|tool_list_start|>" in chat_template:
+    if isinstance(chat_template, str):
+        if "<minimax:tool_call>" in chat_template:
+            return "minimax_m2"
+        elif "<|tool_call>" in chat_template and "<tool_call|>" in chat_template:
+            return "gemma4"
+        elif "<start_function_call>" in chat_template:
+            return "function_gemma"
+        elif "<longcat_tool_call>" in chat_template:
+            return "longcat"
+        elif "<arg_key>" in chat_template:
+            return "glm47"
+        elif (
+            "<|tool_list_start|>" in chat_template
+            or "<|tool_call_start|>" in chat_template
+        ):
+            return "pythonic"
+        elif (
+            "<tool_call>\\n<function=" in chat_template
+            or "<tool_call>\n<function=" in chat_template
+        ):
+            return "qwen3_coder"
+        elif "<|tool_calls_section_begin|>" in chat_template:
+            return "kimi_k2"
+        elif '<function name="' in chat_template and '<param name="' in chat_template:
+            return "minicpm5"
+        elif "[TOOL_CALLS]" in chat_template:
+            return "mistral"
+        elif "<atem:function_calls>" in chat_template:
+            return "muse_spark"
+        elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
+            return "json_tools"
+
+    # No template match, so fall back to the vocab. LFM2.5 conversions for
+    # example have the tool-call tokens but do not name them in the template.
+    vocab = tokenizer.get_vocab()
+    if _is_xtml_vocab(vocab):
+        return "kimi_k3"
+    elif "<|tool_call_start|>" in vocab and "<|tool_call_end|>" in vocab:
         return "pythonic"
-    elif (
-        "<tool_call>\\n<function=" in chat_template
-        or "<tool_call>\n<function=" in chat_template
-    ):
-        return "qwen3_coder"
-    elif "<|tool_calls_section_begin|>" in chat_template:
-        return "kimi_k2"
-    elif "[TOOL_CALLS]" in chat_template:
-        return "mistral"
-    elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
-        return "json_tools"
+
     return None
 
 
@@ -653,12 +699,15 @@ def load(
     model_path,
     tokenizer_config_extra: Optional[Dict[str, Any]] = None,
     eos_token_ids=None,
+    defaults: Optional[Dict[str, Any]] = None,
 ) -> TokenizerWrapper:
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
 
     Note, to use a fast streaming tokenizer, pass a local file path rather than
     a Hugging Face repo ID.
+
+    ``defaults`` are the model's settings for checkpoints without them.
     """
     detokenizer_class = NaiveStreamingDetokenizer
 
@@ -681,10 +730,14 @@ def load(
             elif _is_bpe_decoder(tokenizer_content["decoder"]):
                 detokenizer_class = BPEStreamingDetokenizer
 
+    defaults = defaults or {}
+    if eos_token_ids is None:
+        eos_token_ids = defaults.get("eos_token_ids")
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
 
     chat_template = None
+    response_format = None
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_path, **(tokenizer_config_extra or {})
@@ -692,14 +745,22 @@ def load(
 
     tokenizer_config = tokenizer.init_kwargs
 
-    if chat_template_type := tokenizer_config.get("chat_template_type", False):
-        chat_template = importlib.import_module(
-            f"mlx_lm.chat_templates.{chat_template_type}"
-        ).apply_chat_template
+    chat_template_type = tokenizer_config.get(
+        "chat_template_type", defaults.get("chat_template_type")
+    )
+    if chat_template_type:
+        module = importlib.import_module(f"mlx_lm.chat_templates.{chat_template_type}")
+        # A template in the checkpoint replaces only the default template.
+        if "chat_template_type" in tokenizer_config or tokenizer.chat_template is None:
+            chat_template = module.apply_chat_template
+        response_format = getattr(module, "RESPONSE_FORMAT", None)
 
     tool_parser_type = tokenizer_config.get(
-        "tool_parser_type", _infer_tool_parser(tokenizer)
+        "tool_parser_type", defaults.get("tool_parser_type")
     )
+    if tool_parser_type is None:
+        tool_parser_type = _infer_tool_parser(tokenizer)
+
     if tool_parser_type is not None:
         tool_module = importlib.import_module(f"mlx_lm.tool_parsers.{tool_parser_type}")
         tool_parser = tool_module.parse_tool_call
@@ -719,6 +780,7 @@ def load(
         tool_parser=tool_parser,
         tool_call_start=tool_call_start,
         tool_call_end=tool_call_end,
+        response_format=response_format,
     )
 
 
